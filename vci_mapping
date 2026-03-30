@@ -1,0 +1,454 @@
+// Author: ERAbucay
+// Month Specific Climatological Vegetation Condition Index in Asia
+// Datasets:
+//   - MODIS/061/MOD13A2   (EVI)
+//   - MODIS/061/MCD12Q1   (land cover mask)
+//   - USDOS/LSIB_SIMPLE/2017 (country boundaries)
+//   - User boundary asset:
+//     e.g. projects/silicon-comfort-205603/assets/vci/AsiaContinentFinal
+
+
+// Area of Interest
+// Processing
+var asiaBox = ee.Geometry.Polygon([
+  [[25, 80], [25, -10], [180, -10], [180, 80], [25, 80]]
+], null, false);
+
+// Uploaded Asia boundary asset (user upload their study area boundary)
+
+var asiaBoundary = ee.FeatureCollection(
+  'projects/silicon-comfort-205603/assets/vci/AsiaContinentFinal'
+);
+
+var asiaBounds = asiaBoundary.geometry().bounds();
+
+
+
+// Country features (for display only)
+
+var countriesAll = ee.FeatureCollection('USDOS/LSIB_SIMPLE/2017');
+var asiaCountries = countriesAll.filterBounds(asiaBounds);
+
+Map.centerObject(asiaBoundary, 3);
+
+
+
+// Load MODIS EVI
+
+var modisEVI = ee.ImageCollection('MODIS/061/MOD13A2')
+  .filterBounds(asiaBounds)
+  .select('EVI')
+  .map(function(image) {
+    return image
+      .divide(10000)
+      .copyProperties(image, ['system:time_start']);
+  });
+
+// Land cover mask (MODIS MCD12Q1)
+
+// LC_Type1:
+//   0  = water
+//   15 = permanent snow and ice
+//   16 = barren / sparsely vegetated
+//
+// LW:
+//   1 = water
+//   2 = land
+
+var lc2024 = ee.ImageCollection('MODIS/061/MCD12Q1')
+  .filterDate('2024-01-01', '2024-12-31')
+  .first();
+
+var lcType1 = lc2024.select('LC_Type1');
+var landWater = lc2024.select('LW');
+
+var validLandMask = landWater.eq(2)
+  .and(lcType1.neq(15))
+  .and(lcType1.neq(16));
+
+// Boundary mask from uploaded Asia asset
+var asiaBoundaryMask = ee.Image.constant(1)
+  .clipToCollection(asiaBoundary)
+  .rename('asia_boundary_mask')
+  .selfMask();
+
+// Combined final mask
+var finalMask = asiaBoundaryMask.mask().and(validLandMask);
+
+// Baseline + target year
+
+var baselineStart = '2003-01-01';
+var baselineEnd   = '2023-12-31';  // user should exclude target year
+var targetYear = 2024;
+
+var historicalEVI = modisEVI.filterDate(baselineStart, baselineEnd);
+var targetEVI = modisEVI.filterDate('2024-01-01', '2024-12-31');
+
+var months = ee.List.sequence(1, 12);
+
+var monthNamesEE = ee.List([
+  'January', 'February', 'March', 'April', 'May', 'June',
+  'July', 'August', 'September', 'October', 'November', 'December'
+]);
+
+var monthNamesJS = [
+  'January', 'February', 'March', 'April', 'May', 'June',
+  'July', 'August', 'September', 'October', 'November', 'December'
+];
+
+
+// Month specific climatological VCI
+
+var monthlyVCI2024 = ee.ImageCollection.fromImages(
+  months.map(function(m) {
+    m = ee.Number(m);
+
+    // 2024 target month composite
+    var currentMonthEVI = targetEVI
+      .filter(ee.Filter.calendarRange(m, m, 'month'))
+      .mean()
+      .rename('EVI_current');
+
+    // Historical climatology for same calendar month only
+    var historicalMonth = historicalEVI
+      .filter(ee.Filter.calendarRange(m, m, 'month'));
+
+    var monthMin = historicalMonth.reduce(ee.Reducer.min()).rename('EVI_min_m');
+    var monthMax = historicalMonth.reduce(ee.Reducer.max()).rename('EVI_max_m');
+    var monthRange = monthMax.subtract(monthMin);
+
+    var safeMonthRange = monthRange.where(monthRange.eq(0), 0.0001);
+
+    var vci = currentMonthEVI
+      .subtract(monthMin)
+      .divide(safeMonthRange)
+      .multiply(100)
+      .clamp(0, 100)
+      .rename('VCI')
+      .updateMask(finalMask)
+      .clipToCollection(asiaBoundary)
+      .set({
+        'month': m,
+        'month_name': monthNamesEE.get(m.subtract(1)),
+        'year': targetYear
+      });
+
+    return vci;
+  })
+);
+
+// Preview
+var janVCI = monthlyVCI2024.filter(ee.Filter.eq('month', 1)).first();
+
+// VCI visualization
+
+var vis = {
+  min: 0,
+  max: 100,
+  palette: [
+    '#7f0000',
+    '#b30000',
+    '#d7301f',
+    '#ef6548',
+    '#fc8d59',
+    '#fdbb84',
+    '#fee08b',
+    '#d9ef8b',
+    '#a6d96a',
+    '#66bd63',
+    '#1a9850',
+    '#006837'
+  ]
+};
+
+Map.addLayer(janVCI, vis, 'January 2024 VCI (month-specific baseline)');
+
+
+// Boundary / coastlines for display
+
+var boundaryImage = ee.Image().byte().paint({
+  featureCollection: asiaBoundary,
+  color: 1,
+  width: 1
+});
+
+var countryBoundaryImage = ee.Image().byte().paint({
+  featureCollection: asiaCountries,
+  color: 1,
+  width: 1
+});
+
+// Optional graticule
+
+function makeGraticule(boundsGeom, lonStep, latStep) {
+  lonStep = lonStep || 20;
+  latStep = latStep || 20;
+
+  var coords = ee.List(boundsGeom.coordinates().get(0));
+
+  var xs = coords.map(function(pt) {
+    return ee.Number(ee.List(pt).get(0));
+  });
+
+  var ys = coords.map(function(pt) {
+    return ee.Number(ee.List(pt).get(1));
+  });
+
+  var xmin = ee.Number(xs.reduce(ee.Reducer.min()));
+  var xmax = ee.Number(xs.reduce(ee.Reducer.max()));
+  var ymin = ee.Number(ys.reduce(ee.Reducer.min()));
+  var ymax = ee.Number(ys.reduce(ee.Reducer.max()));
+
+  var lonStart = xmin.divide(lonStep).floor().multiply(lonStep);
+  var lonEnd   = xmax.divide(lonStep).ceil().multiply(lonStep);
+  var latStart = ymin.divide(latStep).floor().multiply(latStep);
+  var latEnd   = ymax.divide(latStep).ceil().multiply(latStep);
+
+  var lonLines = ee.List.sequence(lonStart, lonEnd, lonStep).map(function(lon) {
+    lon = ee.Number(lon);
+    return ee.Feature(
+      ee.Geometry.LineString([[lon, ymin], [lon, ymax]]),
+      {'type': 'lon'}
+    );
+  });
+
+  var latLines = ee.List.sequence(latStart, latEnd, latStep).map(function(lat) {
+    lat = ee.Number(lat);
+    return ee.Feature(
+      ee.Geometry.LineString([[xmin, lat], [xmax, lat]]),
+      {'type': 'lat'}
+    );
+  });
+
+  return ee.FeatureCollection(lonLines.cat(latLines))
+    .filterBounds(boundsGeom);
+}
+
+var graticule = makeGraticule(asiaBounds, 20, 20);
+
+var graticuleImage = ee.Image().byte().paint({
+  featureCollection: graticule,
+  color: 1,
+  width: 1
+});
+
+// RGB display composite
+
+function makeDisplayImage(vciImage) {
+  var vciRgb = ee.Image(vciImage).visualize(vis);
+
+  var graticuleRgb = graticuleImage.visualize({
+    palette: ['bdbdbd'],
+    opacity: 0.35
+  });
+
+  var countryRgb = countryBoundaryImage.visualize({
+    palette: ['777777'],
+    opacity: 0.45
+  });
+
+  var boundaryRgb = boundaryImage.visualize({
+    palette: ['222222'],
+    opacity: 0.9
+  });
+
+  return vciRgb
+    .blend(graticuleRgb)
+    .blend(countryRgb)
+    .blend(boundaryRgb);
+}
+
+// Legend
+
+function makeLegend(visParams, titleText) {
+  var legend = ui.Panel({
+    style: {
+      padding: '10px 12px',
+      border: '1px solid #cccccc',
+      margin: '10px 0 0 0',
+      width: '560px',
+      backgroundColor: 'ffffff'
+    }
+  });
+
+  legend.add(ui.Label(titleText, {
+    fontWeight: 'bold',
+    fontSize: '13px',
+    margin: '0 0 6px 0'
+  }));
+
+  var gradient = ee.Image.pixelLonLat()
+    .select('longitude')
+    .multiply((visParams.max - visParams.min) / 100.0)
+    .add(visParams.min);
+
+  var legendImage = gradient.visualize({
+    min: visParams.min,
+    max: visParams.max,
+    palette: visParams.palette
+  });
+
+  var colorBar = ui.Thumbnail({
+    image: legendImage,
+    params: {
+      bbox: [0, 0, 100, 10],
+      dimensions: '460x22',
+      format: 'png'
+    },
+    style: {
+      margin: '0 8px',
+      maxHeight: '26px',
+      stretch: 'horizontal'
+    }
+  });
+
+  var labels = ui.Panel({
+    widgets: [
+      ui.Label('0', {margin: '4px 8px'}),
+      ui.Label('20', {margin: '4px 8px', textAlign: 'center', stretch: 'horizontal'}),
+      ui.Label('40', {margin: '4px 8px', textAlign: 'center', stretch: 'horizontal'}),
+      ui.Label('60', {margin: '4px 8px', textAlign: 'center', stretch: 'horizontal'}),
+      ui.Label('80', {margin: '4px 8px', textAlign: 'center', stretch: 'horizontal'}),
+      ui.Label('100', {margin: '4px 8px'})
+    ],
+    layout: ui.Panel.Layout.flow('horizontal')
+  });
+
+  legend.add(colorBar);
+  legend.add(labels);
+
+  legend.add(ui.Label(
+    'Low VCI = vegetation stress; high VCI = healthier vegetation condition',
+    {fontSize: '11px', color: '#555555', margin: '4px 8px 0 8px'}
+  ));
+
+  return legend;
+}
+
+// Month panel
+
+function makeMonthPanel(image, monthLabel) {
+  var rgb = makeDisplayImage(image);
+
+  var titleInside = ui.Label(monthLabel, {
+    position: 'top-center',
+    fontWeight: 'bold',
+    fontSize: '13px',
+    color: '222222',
+    backgroundColor: 'rgba(255,255,255,0.75)',
+    padding: '2px 6px',
+    margin: '6px'
+  });
+
+  var thumb = ui.Thumbnail({
+    image: rgb,
+    params: {
+      region: asiaBounds,
+      crs: 'EPSG:4326',
+      dimensions: '320x180',
+      format: 'png'
+    },
+    style: {
+      width: '320px',
+      height: '180px',
+      border: '1px solid #888888',
+      margin: '0px'
+    }
+  });
+
+  var mapFrame = ui.Panel({
+    widgets: [thumb, titleInside],
+    style: {
+      width: '320px',
+      height: '180px',
+      margin: '0px',
+      padding: '0px'
+    },
+    layout: ui.Panel.Layout.absolute()
+  });
+
+  return ui.Panel({
+    widgets: [mapFrame],
+    style: {
+      margin: '5px',
+      padding: '0px',
+      width: '320px'
+    }
+  });
+}
+
+
+
+// Page layout proxy
+
+ui.root.clear();
+
+var page = ui.Panel({
+  layout: ui.Panel.Layout.flow('vertical'),
+  style: {
+    width: '100%',
+    padding: '10px',
+    backgroundColor: 'white'
+  }
+});
+
+var header = ui.Panel({
+  widgets: [
+    ui.Label('Monthly Vegetation Condition Index (VCI) over Asia, 2024', {
+      fontSize: '19px',
+      fontWeight: 'bold',
+      margin: '0 0 4px 0'
+    }),
+    ui.Label('Month-specific climatological baseline | MODIS MOD13A2 EVI-based VCI', {
+      fontSize: '12px',
+      color: '#444444',
+      margin: '0 0 10px 0'
+    })
+  ],
+  style: {
+    padding: '0 0 6px 0'
+  }
+});
+
+page.add(header);
+
+for (var r = 0; r < 4; r++) {
+  var row = ui.Panel({
+    layout: ui.Panel.Layout.flow('horizontal'),
+    style: {
+      stretch: 'horizontal',
+      margin: '0 0 2px 0'
+    }
+  });
+
+  for (var c = 0; c < 3; c++) {
+    var idx = r * 3 + c + 1;
+    var img = monthlyVCI2024.filter(ee.Filter.eq('month', idx)).first();
+    row.add(makeMonthPanel(img, monthNamesJS[idx - 1]));
+  }
+
+  page.add(row);
+}
+
+page.add(makeLegend(vis, 'Vegetation Condition Index (VCI)'));
+
+ui.root.add(page);
+
+
+
+// Export monthly VCI grids
+
+months.getInfo().forEach(function(month) {
+  var image = monthlyVCI2024.filter(ee.Filter.eq('month', month)).first();
+
+  Export.image.toDrive({
+    image: image,
+    description: 'Asia_VCI_2024_MonthSpecificBaseline_Month' + month,
+    folder: 'GEE_VCI_2024',
+    fileNamePrefix: 'Asia_VCI_2024_MonthSpecificBaseline_Month' + month,
+    region: asiaBounds,
+    scale: 10000,
+    crs: 'EPSG:4326',
+    maxPixels: 1e13
+  });
+});
