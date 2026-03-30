@@ -1,0 +1,339 @@
+// Author: ERAbucay
+// MODIS Derived Land Cover Map
+
+// Boundary for area of interest
+
+var asiaBoundary = ee.FeatureCollection(
+  'projects/silicon-comfort-205603/assets/vci/AsiaContinentFinal' // users can upload their own boundary file or use available country/regional data in GEE
+);
+
+var asiaBounds = asiaBoundary.geometry().bounds();
+
+
+// Load country boundaries
+
+var countries = ee.FeatureCollection('USDOS/LSIB_SIMPLE/2017')
+  .filterBounds(asiaBounds);
+
+// Convert boundaries to image for display
+var countryLines = ee.Image().byte().paint({
+  featureCollection: countries,
+  color: 1,
+  width: 1
+});
+
+
+// Load MODIS Land Cover
+
+var dataset = ee.ImageCollection('MODIS/061/MCD12Q1')
+  .filterDate('2014-01-01', '2015-01-01') //users may change date range
+  .first();
+
+var landCover = dataset.select('LC_Type1');
+
+// Clip using user uploaded boundary
+var landCoverAsia = landCover.clipToCollection(asiaBoundary);
+
+
+// Visualization
+
+var visParams = {
+  min: 1,
+  max: 17,
+  palette: [
+    '05450a', // 1 Evergreen Needleleaf Forests
+    '086a10', // 2 Evergreen Broadleaf Forests
+    '54a708', // 3 Deciduous Needleleaf Forests
+    '78d203', // 4 Deciduous Broadleaf Forests
+    '009900', // 5 Mixed Forests
+    'c6b044', // 6 Closed Shrublands
+    'dcd159', // 7 Open Shrublands
+    'dade48', // 8 Woody Savannas
+    'fbff13', // 9 Savannas
+    'b6ff05', // 10 Grasslands
+    '27ff87', // 11 Permanent Wetlands
+    'c24f44', // 12 Croplands
+    'a5a5a5', // 13 Urban and Built-up
+    'ff6d4c', // 14 Cropland/Natural Vegetation Mosaic
+    '69fff8', // 15 Permanent Snow and Ice
+    'f9ffa4', // 16 Barren or Sparsely Vegetated
+    '1c0dff'  // 17 Water Bodies
+  ]
+};
+
+
+// Optional graticule
+
+function makeGraticule(bounds, step) {
+  step = step || 20;
+
+  var coords = ee.List(bounds.coordinates().get(0));
+
+  var xs = coords.map(function(pt) {
+    return ee.Number(ee.List(pt).get(0));
+  });
+
+  var ys = coords.map(function(pt) {
+    return ee.Number(ee.List(pt).get(1));
+  });
+
+  var xmin = ee.Number(xs.reduce(ee.Reducer.min()));
+  var xmax = ee.Number(xs.reduce(ee.Reducer.max()));
+  var ymin = ee.Number(ys.reduce(ee.Reducer.min()));
+  var ymax = ee.Number(ys.reduce(ee.Reducer.max()));
+
+  var lonStart = xmin.divide(step).floor().multiply(step);
+  var lonEnd   = xmax.divide(step).ceil().multiply(step);
+  var latStart = ymin.divide(step).floor().multiply(step);
+  var latEnd   = ymax.divide(step).ceil().multiply(step);
+
+  var lonLines = ee.List.sequence(lonStart, lonEnd, step).map(function(lon) {
+    lon = ee.Number(lon);
+    return ee.Feature(ee.Geometry.LineString([[lon, ymin], [lon, ymax]]));
+  });
+
+  var latLines = ee.List.sequence(latStart, latEnd, step).map(function(lat) {
+    lat = ee.Number(lat);
+    return ee.Feature(ee.Geometry.LineString([[xmin, lat], [xmax, lat]]));
+  });
+
+  return ee.FeatureCollection(lonLines.cat(latLines)).filterBounds(bounds);
+}
+
+var graticule = makeGraticule(asiaBounds, 20);
+
+var graticuleImage = ee.Image().byte().paint({
+  featureCollection: graticule,
+  color: 1,
+  width: 1
+});
+
+
+// Build static figure image
+
+var lcRGB = landCoverAsia.visualize(visParams);
+
+var countryRGB = countryLines.selfMask().visualize({
+  palette: ['555555'],
+  opacity: 0.60
+});
+
+var gridRGB = graticuleImage.selfMask().visualize({
+  palette: ['bbbbbb'],
+  opacity: 0.25
+});
+
+var figureImage = lcRGB
+  .blend(gridRGB)
+  .blend(countryRGB);
+
+
+// Interactive preview map
+
+Map.setOptions('TERRAIN');
+Map.centerObject(asiaBoundary, 3);
+Map.addLayer(landCoverAsia, visParams, 'MODIS Land Cover 2014');
+Map.addLayer(countryLines.selfMask(), {palette: ['555555'], opacity: 0.60}, 'Country Boundaries', false);
+Map.addLayer(graticuleImage.selfMask(), {palette: ['bbbbbb'], opacity: 0.25}, 'Graticule', false);
+
+
+// Title panel
+
+var titlePanel = ui.Panel({
+  style: {
+    padding: '8px 10px',
+    backgroundColor: 'white',
+    margin: '0 0 8px 0'
+  }
+});
+
+titlePanel.add(ui.Label('MODIS Land Cover of Asia (2014)', {
+  fontSize: '20px',
+  fontWeight: 'bold',
+  margin: '0 0 4px 0'
+}));
+
+titlePanel.add(ui.Label(
+  'MODIS/061/MCD12Q1 Derived',
+  {
+    fontSize: '12px',
+    color: '#444444',
+    margin: '0'
+  }
+));
+
+
+// Map thumbnail display
+
+var mapThumb = ui.Thumbnail({
+  image: figureImage,
+  params: {
+    region: asiaBounds,
+    crs: 'EPSG:4326',
+    dimensions: '860x500',
+    format: 'png'
+  },
+  style: {
+    width: '860px',
+    height: '500px',
+    border: '2px solid black',
+    margin: '0px',
+    padding: '0px'
+  }
+});
+
+
+// North arrow
+
+var northArrow = ui.Panel({
+  widgets: [
+    ui.Label('N', {
+      fontSize: '22px',
+      fontWeight: 'bold',
+      textAlign: 'center',
+      margin: '0 auto'
+    }),
+    ui.Label('▲', {
+      fontSize: '28px',
+      textAlign: 'center',
+      margin: '-6px auto 0 auto'
+    })
+  ],
+  style: {
+    position: 'top-left',
+    backgroundColor: 'rgba(255,255,255,0.8)',
+    padding: '4px 6px',
+    margin: '8px'
+  }
+});
+
+
+// Scale label
+
+var scaleBox = ui.Label(
+  'Approximate continental scale | MODIS resolution ~500 m',
+  {
+    position: 'bottom-left',
+    backgroundColor: 'rgba(255,255,255,0.8)',
+    padding: '4px 6px',
+    margin: '8px',
+    fontSize: '11px',
+    color: '#222222'
+  }
+);
+
+
+// Map frame
+
+var mapFrameHeight = '510px';
+
+var mapFrame = ui.Panel({
+  widgets: [mapThumb, northArrow, scaleBox],
+  layout: ui.Panel.Layout.absolute(),
+  style: {
+    width: '870px',
+    height: mapFrameHeight,
+    margin: '0px',
+    padding: '0px'
+  }
+});
+
+
+// Map legend
+
+function legendRow(color, name) {
+  var colorBox = ui.Label('', {
+    backgroundColor: '#' + color,
+    padding: '6px',
+    margin: '0 6px 2px 0',
+    border: '1px solid #999999'
+  });
+
+  var label = ui.Label(name, {
+    fontSize: '11px',
+    margin: '0 0 2px 0'
+  });
+
+  return ui.Panel({
+    widgets: [colorBox, label],
+    layout: ui.Panel.Layout.flow('horizontal'),
+    style: {
+      margin: '0px',
+      padding: '0px'
+    }
+  });
+}
+
+var legend = ui.Panel({
+  style: {
+    width: '340px',
+    height: mapFrameHeight,
+    padding: '8px 10px',
+    backgroundColor: 'white',
+    margin: '0 0 0 8px'
+  }
+});
+
+legend.add(ui.Label('Land Cover Classes', {
+  fontWeight: 'bold',
+  fontSize: '13px',
+  margin: '0 0 6px 0'
+}));
+
+legend.add(legendRow('05450a', '1  Evergreen Needleleaf Forest'));
+legend.add(legendRow('086a10', '2  Evergreen Broadleaf Forest'));
+legend.add(legendRow('54a708', '3  Deciduous Needleleaf Forest'));
+legend.add(legendRow('78d203', '4  Deciduous Broadleaf Forest'));
+legend.add(legendRow('009900', '5  Mixed Forest'));
+legend.add(legendRow('c6b044', '6  Closed Shrublands'));
+legend.add(legendRow('dcd159', '7  Open Shrublands'));
+legend.add(legendRow('dade48', '8  Woody Savannas'));
+legend.add(legendRow('fbff13', '9  Savannas'));
+legend.add(legendRow('b6ff05', '10 Grasslands'));
+legend.add(legendRow('27ff87', '11 Permanent Wetlands'));
+legend.add(legendRow('c24f44', '12 Croplands'));
+legend.add(legendRow('a5a5a5', '13 Urban and Built-up'));
+legend.add(legendRow('ff6d4c', '14 Cropland/Natural Vegetation Mosaic'));
+legend.add(legendRow('69fff8', '15 Permanent Snow and Ice'));
+legend.add(legendRow('f9ffa4', '16 Barren or Sparsely Vegetated'));
+legend.add(legendRow('1c0dff', '17 Water Bodies'));
+
+
+// Content panel
+
+var contentPanel = ui.Panel({
+  widgets: [mapFrame, legend],
+  layout: ui.Panel.Layout.flow('horizontal'),
+  style: {
+    stretch: 'both'
+  }
+});
+
+
+// Proxy Map Page layout for visualization in GEE
+
+var page = ui.Panel({
+  widgets: [titlePanel, contentPanel],
+  layout: ui.Panel.Layout.flow('vertical'),
+  style: {
+    width: '100%',
+    height: '100%',
+    padding: '10px',
+    backgroundColor: 'white'
+  }
+});
+
+ui.root.clear();
+ui.root.add(page);
+
+
+// Grid output export
+
+Export.image.toDrive({
+  image: landCoverAsia,
+  description: 'MODIS_LandCover_Asia_2014', // users may change year
+  scale: 500,
+  region: asiaBounds,
+  crs: 'EPSG:4326',
+  maxPixels: 1e13
+});
