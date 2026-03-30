@@ -1,0 +1,408 @@
+// Author: ERAbucay
+// Monthly Total Precipitation over Asia using uploaded boundary asset
+// Datasets:
+//   - NASA/GPM_L3/IMERG_V07
+//   - USDOS/LSIB_SIMPLE/2017
+//   - User boundary asset:
+//     projects/silicon-comfort-205603/assets/vci/AsiaContinentFinal
+
+
+
+// Processing box 
+var asiaBox = ee.Geometry.Polygon([
+  [[25, 80], [25, -10], [180, -10], [180, 80], [25, 80]]
+], null, false);
+
+// Uploaded Asia boundary asset
+var asiaBoundary = ee.FeatureCollection(
+  'projects/silicon-comfort-205603/assets/vci/AsiaContinentFinal' //user may upload and set their area of interest or use existing GEE country/regional boundary datasets
+);
+
+var asiaBounds = asiaBoundary.geometry().bounds();
+
+
+
+// Dataset
+
+var imerg = ee.ImageCollection('NASA/GPM_L3/IMERG_V07')
+  .filterBounds(asiaBounds)
+  .filterDate('2024-01-01', '2024-12-31') // user can set date range
+  .select('precipitation');
+
+
+
+// Monthly total rainfall in mm
+
+var months = ee.List.sequence(1, 12);
+
+var monthNamesEE = ee.List([
+  'January', 'February', 'March', 'April', 'May', 'June',
+  'July', 'August', 'September', 'October', 'November', 'December'
+]);
+
+var monthNamesJS = [
+  'January', 'February', 'March', 'April', 'May', 'June',
+  'July', 'August', 'September', 'October', 'November', 'December'
+];
+
+var monthlyImages = ee.ImageCollection.fromImages(
+  months.map(function(m) {
+    m = ee.Number(m);
+
+    var monthly = imerg
+      .filter(ee.Filter.calendarRange(m, m, 'month'))
+      .sum()
+      .clipToCollection(asiaBoundary)
+      .rename('monthly_precip_mm')
+      .set({
+        'month': m,
+        'month_name': monthNamesEE.get(m.subtract(1)),
+        'year': 2024
+      });
+
+    return monthly;
+  })
+);
+
+
+
+// Map visualization
+// Precipitation palette:
+// light dry tones -> blues -> deep blue/purple for very wet areas
+
+var vis = {
+  min: 0,
+  max: 1200,
+  palette: [
+    '#f7f7f7',
+    '#e3f2fd',
+    '#bbdefb',
+    '#90caf9',
+    '#64b5f6',
+    '#42a5f5',
+    '#1e88e5',
+    '#1565c0',
+    '#0d47a1',
+    '#4a148c'
+  ]
+};
+
+// Optional preview on main map
+Map.centerObject(asiaBoundary, 3);
+Map.addLayer(
+  monthlyImages.filter(ee.Filter.eq('month', 1)).first(),
+  vis,
+  'January 2024 Rainfall'
+);
+
+
+// Reference boundaries
+
+
+// country boundaries/coastlines for reference
+var countries = ee.FeatureCollection('USDOS/LSIB_SIMPLE/2017')
+  .filterBounds(asiaBounds);
+
+// Main Asia boundary outline from uploaded asset
+var asiaBoundaryImage = ee.Image().byte().paint({
+  featureCollection: asiaBoundary,
+  color: 1,
+  width: 1
+});
+
+// Country boundary reference overlay
+var countryBoundaryImage = ee.Image().byte().paint({
+  featureCollection: countries,
+  color: 1,
+  width: 1
+});
+
+
+
+// Optional graticule for readability
+
+function makeGraticule(boundsGeom, lonStep, latStep) {
+  lonStep = lonStep || 20;
+  latStep = latStep || 20;
+
+  var coords = ee.List(boundsGeom.coordinates().get(0));
+
+  var xs = coords.map(function(pt) {
+    return ee.Number(ee.List(pt).get(0));
+  });
+
+  var ys = coords.map(function(pt) {
+    return ee.Number(ee.List(pt).get(1));
+  });
+
+  var xmin = ee.Number(xs.reduce(ee.Reducer.min()));
+  var xmax = ee.Number(xs.reduce(ee.Reducer.max()));
+  var ymin = ee.Number(ys.reduce(ee.Reducer.min()));
+  var ymax = ee.Number(ys.reduce(ee.Reducer.max()));
+
+  var lonStart = xmin.divide(lonStep).floor().multiply(lonStep);
+  var lonEnd   = xmax.divide(lonStep).ceil().multiply(lonStep);
+  var latStart = ymin.divide(latStep).floor().multiply(latStep);
+  var latEnd   = ymax.divide(latStep).ceil().multiply(latStep);
+
+  var lonLines = ee.List.sequence(lonStart, lonEnd, lonStep).map(function(lon) {
+    lon = ee.Number(lon);
+    return ee.Feature(
+      ee.Geometry.LineString([[lon, ymin], [lon, ymax]]),
+      {'type': 'lon'}
+    );
+  });
+
+  var latLines = ee.List.sequence(latStart, latEnd, latStep).map(function(lat) {
+    lat = ee.Number(lat);
+    return ee.Feature(
+      ee.Geometry.LineString([[xmin, lat], [xmax, lat]]),
+      {'type': 'lat'}
+    );
+  });
+
+  return ee.FeatureCollection(lonLines.cat(latLines))
+    .filterBounds(boundsGeom);
+}
+
+var graticule = makeGraticule(asiaBounds, 20, 20);
+
+var graticuleImage = ee.Image().byte().paint({
+  featureCollection: graticule,
+  color: 1,
+  width: 1
+});
+
+
+
+// RGB composite for each month
+// Convert rainfall image + graticule + boundaries into a display RGB image
+
+function makeDisplayImage(monthlyImage) {
+  var precipRgb = ee.Image(monthlyImage).visualize(vis);
+
+  var graticuleRgb = graticuleImage.visualize({
+    palette: ['bdbdbd'],
+    opacity: 0.45
+  });
+
+  var countryRgb = countryBoundaryImage.visualize({
+    palette: ['777777'],
+    opacity: 0.45
+  });
+
+  var asiaRgb = asiaBoundaryImage.visualize({
+    palette: ['222222'],
+    opacity: 0.90
+  });
+
+  return precipRgb
+    .blend(graticuleRgb)
+    .blend(countryRgb)
+    .blend(asiaRgb);
+}
+
+
+
+// Legend
+
+function makeLegend(visParams, titleText) {
+  var legend = ui.Panel({
+    style: {
+      padding: '10px 12px',
+      border: '1px solid #cccccc',
+      margin: '10px 0 0 0',
+      width: '560px',
+      backgroundColor: 'ffffff'
+    }
+  });
+
+  legend.add(ui.Label(titleText, {
+    fontWeight: 'bold',
+    fontSize: '13px',
+    margin: '0 0 6px 0'
+  }));
+
+  var gradient = ee.Image.pixelLonLat()
+    .select('longitude')
+    .multiply((visParams.max - visParams.min) / 100.0)
+    .add(visParams.min);
+
+  var legendImage = gradient.visualize({
+    min: visParams.min,
+    max: visParams.max,
+    palette: visParams.palette
+  });
+
+  var colorBar = ui.Thumbnail({
+    image: legendImage,
+    params: {
+      bbox: [0, 0, 100, 10],
+      dimensions: '460x22',
+      format: 'png'
+    },
+    style: {
+      margin: '0 8px',
+      maxHeight: '26px',
+      stretch: 'horizontal'
+    }
+  });
+
+  var labels = ui.Panel({
+    widgets: [
+      ui.Label('0', {margin: '4px 8px'}),
+      ui.Label('300', {
+        margin: '4px 8px',
+        textAlign: 'center',
+        stretch: 'horizontal'
+      }),
+      ui.Label('600', {
+        margin: '4px 8px',
+        textAlign: 'center',
+        stretch: 'horizontal'
+      }),
+      ui.Label('900', {
+        margin: '4px 8px',
+        textAlign: 'center',
+        stretch: 'horizontal'
+      }),
+      ui.Label('1200 mm', {margin: '4px 8px'})
+    ],
+    layout: ui.Panel.Layout.flow('horizontal')
+  });
+
+  legend.add(colorBar);
+  legend.add(labels);
+
+  return legend;
+}
+
+
+
+// Month panel
+
+function makeMonthPanel(image, monthLabel) {
+  var rgb = makeDisplayImage(image);
+
+  var titleInside = ui.Label(monthLabel, {
+    position: 'top-center',
+    fontWeight: 'bold',
+    fontSize: '13px',
+    color: '222222',
+    backgroundColor: 'rgba(255,255,255,0.75)',
+    padding: '2px 6px',
+    margin: '6px'
+  });
+
+  var thumb = ui.Thumbnail({
+    image: rgb,
+    params: {
+      region: asiaBounds,
+      crs: 'EPSG:4326',
+      dimensions: '320x180',
+      format: 'png'
+    },
+    style: {
+      width: '320px',
+      height: '180px',
+      border: '1px solid #888888',
+      margin: '0px'
+    }
+  });
+
+  var mapFrame = ui.Panel({
+    widgets: [thumb, titleInside],
+    style: {
+      width: '320px',
+      height: '180px',
+      margin: '0px',
+      padding: '0px'
+    },
+    layout: ui.Panel.Layout.absolute()
+  });
+
+  return ui.Panel({
+    widgets: [mapFrame],
+    style: {
+      margin: '5px',
+      padding: '0px',
+      width: '320px'
+    }
+  });
+}
+
+
+
+// Page layout 4x3 for quick visualization
+
+ui.root.clear();
+
+var page = ui.Panel({
+  layout: ui.Panel.Layout.flow('vertical'),
+  style: {
+    width: '100%',
+    padding: '10px',
+    backgroundColor: 'white'
+  }
+});
+
+var header = ui.Panel({
+  widgets: [
+    ui.Label('Monthly Total Precipitation over Asia, 2024', { // user has an option to change title here
+      fontSize: '19px',
+      fontWeight: 'bold',
+      margin: '0 0 4px 0'
+    }),
+    ui.Label('NASA GPM IMERG V07, values in millimeters (mm)', {
+      fontSize: '12px',
+      color: '#444444',
+      margin: '0 0 10px 0'
+    })
+  ],
+  style: {
+    padding: '0 0 6px 0'
+  }
+});
+
+page.add(header);
+
+for (var r = 0; r < 4; r++) {
+  var row = ui.Panel({
+    layout: ui.Panel.Layout.flow('horizontal'),
+    style: {
+      stretch: 'horizontal',
+      margin: '0 0 2px 0'
+    }
+  });
+
+  for (var c = 0; c < 3; c++) {
+    var idx = r * 3 + c + 1;
+    var img = monthlyImages.filter(ee.Filter.eq('month', idx)).first();
+    row.add(makeMonthPanel(img, monthNamesJS[idx - 1]));
+  }
+
+  page.add(row);
+}
+
+page.add(makeLegend(vis, 'Monthly precipitation'));
+
+ui.root.add(page);
+
+
+
+// Optional exports of grids
+
+months.getInfo().forEach(function(month) {
+  var image = monthlyImages.filter(ee.Filter.eq('month', month)).first();
+
+  Export.image.toDrive({
+    image: image,
+    description: 'Asia_MonthlyPrecip_2024_' + month,
+    folder: 'GEE_Precip_2024',
+    fileNamePrefix: 'Asia_MonthlyPrecip_2024_' + month,
+    region: asiaBounds,
+    scale: 10000,
+    crs: 'EPSG:4326',
+    maxPixels: 1e13
+  });
+});
